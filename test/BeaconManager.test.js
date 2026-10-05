@@ -362,13 +362,12 @@ describe('BeaconManager', function() {
 
         beforeEach(function() {
             // Setup fetch stub to simulate a successful response
+            // (_finalize is invoked by the method's own promise chain, so it must
+            // not be called from inside the stub — _saveFinalResultIntoDB() now
+            // returns its promise and the await below observes the full chain.)
             fetchStub = sinon.stub(global, 'fetch').callsFake(() =>
                 Promise.resolve({
                     json: () => Promise.resolve({ message: 'Data saved successfully' })
-                }).then(response => {
-                    // Simulate calling _finalize after the fetch promise resolves
-                    beacon._finalize();
-                    return response;
                 })
             );
             global.document = {
@@ -437,6 +436,173 @@ describe('BeaconManager', function() {
             sinon.assert.calledOnce(saveFinalResultIntoDBSpy);
         });
     });
+    describe('#_getGeneratedBefore() with a stale nonce', function() {
+        let fetchStub;
+        let isPageCachedStub;
+
+        beforeEach(function() {
+            isPageCachedStub = sinon.stub(BeaconUtils, 'isPageCached').returns(true);
+            fetchStub = sinon.stub(global, 'fetch');
+            beacon = new BeaconManager(JSON.parse(JSON.stringify(config)));
+        });
+
+        afterEach(function() {
+            isPageCachedStub.restore();
+            fetchStub.restore();
+        });
+
+        it('should refresh the nonce and retry once when the check returns 403', async function() {
+            fetchStub.onCall(0).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+            fetchStub.onCall(1).resolves({
+                json: () => Promise.resolve({ success: true, data: { nonce: 'freshnonce' } })
+            });
+            fetchStub.onCall(2).resolves({
+                json: () => Promise.resolve({ success: true, data: { lcp: 'not found', lrc: 'not found' } })
+            });
+
+            const result = await beacon._getGeneratedBefore();
+
+            assert.strictEqual(fetchStub.callCount, 3);
+            // The FormData object is reused (mutated) by the retry, so the first
+            // call cannot be inspected afterwards — assert the sequence instead:
+            // refresh endpoint called once, and the retried check carries the fresh nonce.
+            assert.strictEqual(formDataToObject(fetchStub.getCall(1).args[1].body)['action'], 'rocket_beacon_nonce');
+            assert.strictEqual(formDataToObject(fetchStub.getCall(2).args[1].body)['rocket_beacon_nonce'], 'freshnonce');
+            assert.strictEqual(beacon.config.nonce, 'freshnonce');
+            assert.deepStrictEqual(result, { lcp: 'not found', lrc: 'not found' });
+        });
+
+        it('should return false when the check returns 403 and the nonce cannot be refreshed', async function() {
+            fetchStub.onCall(0).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+            fetchStub.onCall(1).resolves({
+                json: () => Promise.resolve(0)
+            });
+
+            const result = await beacon._getGeneratedBefore();
+
+            assert.strictEqual(result, false);
+            assert.strictEqual(fetchStub.callCount, 2);
+        });
+
+        it('should not refresh the nonce more than once', async function() {
+            fetchStub.onCall(0).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+            fetchStub.onCall(1).resolves({
+                json: () => Promise.resolve({ success: true, data: { nonce: 'freshnonce' } })
+            });
+            fetchStub.onCall(2).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+
+            const result = await beacon._getGeneratedBefore();
+
+            // Initial call + one refresh + one retry, then it gives up instead of looping.
+            assert.strictEqual(fetchStub.callCount, 3);
+            assert.strictEqual(result, false);
+        });
+
+        it('should return false when the response body is not valid JSON', async function() {
+            fetchStub.resolves({
+                status: 200,
+                json: () => Promise.reject(new Error('invalid json'))
+            });
+
+            const result = await beacon._getGeneratedBefore();
+
+            assert.strictEqual(result, false);
+            assert.strictEqual(fetchStub.callCount, 1);
+        });
+
+        it('should return false when the response has no data field', async function() {
+            fetchStub.resolves({
+                status: 200,
+                json: () => Promise.resolve({ success: false })
+            });
+
+            const result = await beacon._getGeneratedBefore();
+
+            assert.strictEqual(result, false);
+        });
+
+        it('should return false when fetch rejects', async function() {
+            fetchStub.rejects(new Error('network error'));
+
+            const result = await beacon._getGeneratedBefore();
+
+            assert.strictEqual(result, false);
+        });
+    });
+
+    describe('#_saveFinalResultIntoDB() with a stale nonce', function() {
+        let fetchStub;
+        let finalizeSpy;
+
+        beforeEach(function() {
+            fetchStub = sinon.stub(global, 'fetch');
+            beacon = new BeaconManager(JSON.parse(JSON.stringify(config)));
+            beacon.lcpBeacon = new BeaconLcp(beacon.config);
+            beacon.lcpBeacon.performanceImages = [{ src: 'http://example.com/image.jpg', label: 'lcp' }];
+            beacon.errorCode = '';
+            beacon.scriptTimer = new Date();
+            finalizeSpy = sinon.spy(beacon, '_finalize');
+        });
+
+        afterEach(function() {
+            fetchStub.restore();
+            finalizeSpy.restore();
+        });
+
+        it('should refresh the nonce and retry the save once on 403', async function() {
+            fetchStub.onCall(0).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+            fetchStub.onCall(1).resolves({
+                json: () => Promise.resolve({ success: true, data: { nonce: 'freshnonce' } })
+            });
+            fetchStub.onCall(2).resolves({
+                json: () => Promise.resolve({ success: true, data: { lcp: 'saved' } })
+            });
+
+            await beacon._saveFinalResultIntoDB();
+
+            assert.strictEqual(fetchStub.callCount, 3);
+            assert.strictEqual(formDataToObject(fetchStub.getCall(0).args[1].body)['action'], 'rocket_beacon');
+            assert.strictEqual(formDataToObject(fetchStub.getCall(1).args[1].body)['action'], 'rocket_beacon_nonce');
+            assert.strictEqual(formDataToObject(fetchStub.getCall(2).args[1].body)['action'], 'rocket_beacon');
+            assert.strictEqual(formDataToObject(fetchStub.getCall(2).args[1].body)['rocket_beacon_nonce'], 'freshnonce');
+            sinon.assert.calledOnce(finalizeSpy);
+        });
+
+        it('should finalize once when the save keeps returning 403', async function() {
+            fetchStub.onCall(0).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+            fetchStub.onCall(1).resolves({
+                json: () => Promise.resolve({ success: true, data: { nonce: 'freshnonce' } })
+            });
+            fetchStub.onCall(2).resolves({
+                status: 403,
+                json: () => Promise.resolve(-1)
+            });
+
+            await beacon._saveFinalResultIntoDB();
+
+            assert.strictEqual(fetchStub.callCount, 3);
+            sinon.assert.calledOnce(finalizeSpy);
+        });
+    });
+
     describe('#_finalize()', function() {
         let setAttributeSpy, clearTimeoutSpy;
 

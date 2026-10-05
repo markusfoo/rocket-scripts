@@ -16,6 +16,7 @@ class BeaconManager {
         this.preconnectExternalDomainBeacon = null;
         this.infiniteLoopId = null;
         this.errorCode = '';
+        this.nonceRefreshed = false;
         this.logger = new Logger(this.config.debug);
     }
 
@@ -112,14 +113,76 @@ class BeaconManager {
         data_check.append('url', this.config.url);
         data_check.append('is_mobile', this.config.is_mobile);
 
-        const beacon_data_response = await fetch(this.config.ajax_url, {
-            method: "POST",
-            credentials: 'same-origin',
-            body: data_check
-        }).then(data => data.json());
+        // The nonce was generated at page render time and may have expired
+        // while the page was sitting in the cache: a 403 then triggers a
+        // single nonce refresh + retry instead of crashing below.
+        const beacon_data_response = await this._fetchBeaconData(data_check);
+
+        if (!beacon_data_response || !beacon_data_response.data) {
+            return false;
+        }
 
         return beacon_data_response.data;
-        
+    }
+
+    async _fetchBeaconData(data, headers = {}) {
+        try {
+            const response = await fetch(this.config.ajax_url, {
+                method: "POST",
+                credentials: 'same-origin',
+                body: data,
+                headers: headers
+            });
+
+            if (403 === response.status && await this._refreshNonce()) {
+                data.set('rocket_beacon_nonce', this.config.nonce);
+
+                return await this._fetchBeaconData(data, headers);
+            }
+
+            return await response.json().catch(() => null);
+        } catch (error) {
+            this.logger.logMessage(error);
+
+            return null;
+        }
+    }
+
+    async _refreshNonce() {
+        if (this.nonceRefreshed) {
+            return false;
+        }
+
+        this.nonceRefreshed = true;
+
+        let data_refresh = new FormData();
+        data_refresh.append('action', 'rocket_beacon_nonce');
+
+        try {
+            const response = await fetch(this.config.ajax_url, {
+                method: "POST",
+                credentials: 'same-origin',
+                body: data_refresh
+            });
+
+            const json = await response.json().catch(() => null);
+
+            if (!json || !json.data || !json.data.nonce) {
+                this.logger.logMessage('Beacon nonce could not be refreshed');
+
+                return false;
+            }
+
+            this.config.nonce = json.data.nonce;
+
+            this.logger.logMessage('Beacon nonce refreshed after a 403 response');
+
+            return true;
+        } catch (error) {
+            this.logger.logMessage(error);
+
+            return false;
+        }
     }
 
     _saveFinalResultIntoDB() {
@@ -138,20 +201,11 @@ class BeaconManager {
         data.append('status', this._getFinalStatus());
         data.append('results', JSON.stringify(results));
 
-        fetch(this.config.ajax_url, {
-            method: "POST",
-            credentials: 'same-origin',
-            body: data,
-            headers: {
-                'wpr-saas-no-intercept': true
-            }
+        return this._fetchBeaconData(data, {
+            'wpr-saas-no-intercept': true
         })
-            .then(response => response.json())
-            .then(data => {
-                this.logger.logMessage(data.data.lcp);
-            })
-            .catch(error => {
-                this.logger.logMessage(error);
+            .then(json => {
+                this.logger.logMessage(json && json.data ? json.data.lcp : '');
             })
             .finally(() => {
                 this._finalize();
