@@ -155,7 +155,7 @@ class BeaconManager {
 
         this.nonceRefreshed = true;
 
-        let data_refresh = new FormData();
+        const data_refresh = new FormData();
         data_refresh.append('action', 'rocket_beacon_nonce');
 
         try {
