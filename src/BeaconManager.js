@@ -131,10 +131,10 @@ class BeaconManager {
                 method: "POST",
                 credentials: 'same-origin',
                 body: data,
-                headers: headers
+                headers
             });
 
-            if (403 === response.status && await this._refreshNonce()) {
+            if (response.status === 403 && await this._refreshNonce()) {
                 data.set('rocket_beacon_nonce', this.config.nonce);
 
                 return await this._fetchBeaconData(data, headers);
