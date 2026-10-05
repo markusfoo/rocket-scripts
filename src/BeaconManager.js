@@ -126,26 +126,28 @@ class BeaconManager {
     }
 
     async _fetchBeaconData(data, headers = {}) {
-        try {
-            const response = await fetch(this.config.ajax_url, {
-                method: "POST",
-                credentials: 'same-origin',
-                body: data,
-                headers
-            });
-
-            if (response.status === 403 && await this._refreshNonce()) {
-                data.set('rocket_beacon_nonce', this.config.nonce);
-
-                return await this._fetchBeaconData(data, headers);
-            }
-
-            return await response.json().catch(() => null);
-        } catch (error) {
+        const response = await fetch(this.config.ajax_url, {
+            method: "POST",
+            credentials: 'same-origin',
+            body: data,
+            headers
+        }).catch(error => {
             this.logger.logMessage(error);
 
             return null;
+        });
+
+        if (!response) {
+            return null;
         }
+
+        if (response.status === 403 && await this._refreshNonce()) {
+            data.set('rocket_beacon_nonce', this.config.nonce);
+
+            return await this._fetchBeaconData(data, headers);
+        }
+
+        return await response.json().catch(() => null);
     }
 
     async _refreshNonce() {
